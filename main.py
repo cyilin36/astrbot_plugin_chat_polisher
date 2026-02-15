@@ -49,7 +49,7 @@ _POLISHING_GUARD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "astrbot_plugin_chat_polisher",
     "cyilin36",
     "在回复发送前调用指定提供商进行文本润色",
-    "1.0",
+    "1.1",
     "https://github.com/cyilin36/astrbot_plugin_chat_polisher",
 )
 class ChatPolisherPlugin(Star):
