@@ -1,6 +1,6 @@
 name: astrbot_plugin_chat_polisher
 display_name: 最终回复润色
 version: 1.0
-author: cyilin36
-description: 在 AI 回复发送给用户之前，自动使用指定模型进行文本润色
+author: cyilin
+description: 自动将输出的回复文本内容截取，并通过设定的规则进行润色后发出。
 repo: https://github.com/cyilin36/astrbot_plugin_chat_polisher
