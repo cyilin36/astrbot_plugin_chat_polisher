@@ -10,5 +10,24 @@
     "type": "text",
     "hint": "在此输入你的润色要求，例如：去掉 Markdown，改为口语化聊天风格",
     "default": ""
+  },
+  "polish_timeout_seconds": {
+    "description": "润色调用超时（秒）",
+    "type": "float",
+    "hint": "二次调用 LLM 的超时上限，超过即回退",
+    "default": 12
+  },
+  "failure_mode": {
+    "description": "润色失败后怎么处理",
+    "type": "string",
+    "options": ["发送原文（推荐）", "发送失败提示"],
+    "hint": "发送原文：用户会收到未润色的原始回复；发送失败提示：用户会看到下方配置的失败提示语",
+    "default": "发送原文（推荐）"
+  },
+  "failure_message": {
+    "description": "润色失败提示语",
+    "type": "string",
+    "hint": "仅当上面选择“发送失败提示”时使用",
+    "default": "润色失败，请检查日志。"
   }
 }
