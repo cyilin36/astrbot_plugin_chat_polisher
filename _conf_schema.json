@@ -1,0 +1,14 @@
+{
+  "polish_provider": {
+    "description": "润色使用的模型提供商",
+    "type": "string",
+    "hint": "留空则使用主AI（当前配置的默认模型）",
+    "_special": "select_provider"
+  },
+  "polish_prompt": {
+    "description": "润色提示词",
+    "type": "text",
+    "hint": "在此输入你的润色要求，例如：去掉 Markdown，改为口语化聊天风格",
+    "default": ""
+  }
+}
