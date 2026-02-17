@@ -43,7 +43,7 @@ git clone https://github.com/cyilin36/astrbot_plugin_chat_polisher.git
    - 有标记：提取消息链中的 `Plain` 文本并调用模型润色。
    - 无标记：直接放过（如指令回复）。
 3. 按配置选择润色 provider，调用 `provider.text_chat()`，并替换文本段。
-4. 在 `after_message_sent` 立即清理标记；同时后台周期任务会清理过期标记。
+4. 标记由后台周期任务按配置统一清理：每隔一段时间检查并删除过期标记。
 
 识别标记仅存在于插件内存中，不写入消息内容，也不会影响 AI 对文本/图片的正常读取。
 
@@ -52,3 +52,7 @@ git clone https://github.com/cyilin36/astrbot_plugin_chat_polisher.git
 - 二次润色会增加一次模型调用，带来额外延迟和 token 消耗。
 - 回复文本会发送到你配置的润色模型提供商，请按实际场景评估隐私与合规。
 - 润色调用失败或超时时，按 `failure_mode` 执行回退策略。
+
+## 更新日志
+
+- 请查看 `CHANGELOG.md`。

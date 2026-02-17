@@ -53,7 +53,7 @@ _POLISHING_GUARD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "astrbot_plugin_chat_polisher",
     "cyilin36",
     "在回复发送前调用指定提供商进行文本润色",
-    "1.2",
+    "1.3",
     "https://github.com/cyilin36/astrbot_plugin_chat_polisher",
 )
 class ChatPolisherPlugin(Star):
@@ -74,11 +74,6 @@ class ChatPolisherPlugin(Star):
         self._ensure_mark_cleanup_task()
         key = self._build_event_mark_key(event)
         self._llm_marks[key] = time.monotonic()
-
-    @filter.after_message_sent()
-    async def clear_ai_reply_mark_after_send(self, event: AstrMessageEvent):
-        """消息发送后清理标记，避免残留占用。"""
-        self._clear_event_mark(event)
 
     @filter.on_decorating_result(priority=100)
     async def force_polish_before_send(self, event: AstrMessageEvent):
@@ -292,10 +287,6 @@ class ChatPolisherPlugin(Star):
             self._llm_marks.pop(key, None)
             return False
         return True
-
-    def _clear_event_mark(self, event: AstrMessageEvent):
-        key = self._build_event_mark_key(event)
-        self._llm_marks.pop(key, None)
 
     def _ensure_mark_cleanup_task(self):
         if self._mark_cleanup_task and not self._mark_cleanup_task.done():
