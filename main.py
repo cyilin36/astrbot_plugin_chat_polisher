@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import time
 from typing import Any, Protocol, TypeAlias
 
 from astrbot.api import AstrBotConfig, logger
@@ -17,6 +18,9 @@ DEFAULT_POLISH_PROMPT = (
     "只输出润色后的最终文本，不要解释。\n\n"
     "待润色文本：\n{{text}}"
 )
+
+DEFAULT_MARK_RETENTION_SECONDS = 300.0
+DEFAULT_MARK_CHECK_INTERVAL_SECONDS = 60.0
 
 
 class ProviderResponseProtocol(Protocol):
@@ -61,11 +65,31 @@ class ChatPolisherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._llm_marks: dict[str, float] = {}
+        self._mark_cleanup_task: asyncio.Task[None] | None = None
+
+    @filter.on_llm_request()
+    async def mark_ai_reply_flow(self, event: AstrMessageEvent, req: Any):
+        """仅在默认 AI 对话链路触发时记录标记。"""
+        self._ensure_mark_cleanup_task()
+        key = self._build_event_mark_key(event)
+        if not key:
+            return
+        self._llm_marks[key] = time.monotonic()
+
+    @filter.after_message_sent()
+    async def clear_ai_reply_mark_after_send(self, event: AstrMessageEvent):
+        """消息发送后清理标记，避免残留占用。"""
+        self._clear_event_mark(event)
 
     @filter.on_decorating_result(priority=100)
     async def force_polish_before_send(self, event: AstrMessageEvent):
         """发送前钩子：对消息链中的文本段进行润色并原位替换。"""
         if _POLISHING_GUARD.get():
+            return
+
+        self._ensure_mark_cleanup_task()
+        if not self._has_valid_llm_mark(event):
             return
 
         result = event.get_result()
@@ -91,6 +115,18 @@ class ChatPolisherPlugin(Star):
 
         if new_chain:
             result.chain = new_chain
+
+    async def terminate(self):
+        """插件停用时清理后台任务。"""
+        task = self._mark_cleanup_task
+        self._mark_cleanup_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._llm_marks.clear()
 
     def _resolve_polish_provider(self, event: AstrMessageEvent) -> TextChatProviderProtocol | None:
         """解析润色使用的提供商。"""
@@ -236,3 +272,83 @@ class ChatPolisherPlugin(Star):
     def _get_failure_message(self) -> str:
         message = str(self.config.get("failure_message", "润色失败，请检查日志。") or "").strip()
         return message or "润色失败，请检查日志。"
+
+    def _build_event_mark_key(self, event: AstrMessageEvent) -> str:
+        message_id = str(
+            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+        ).strip()
+        umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+
+        if message_id or umo:
+            return f"{umo}::{message_id}"
+        return f"event::{id(event)}"
+
+    def _has_valid_llm_mark(self, event: AstrMessageEvent) -> bool:
+        key = self._build_event_mark_key(event)
+        if not key:
+            return False
+
+        marked_at = self._llm_marks.get(key)
+        if marked_at is None:
+            return False
+
+        ttl = self._get_mark_retention_seconds()
+        if time.monotonic() - marked_at > ttl:
+            self._llm_marks.pop(key, None)
+            return False
+        return True
+
+    def _clear_event_mark(self, event: AstrMessageEvent):
+        key = self._build_event_mark_key(event)
+        if not key:
+            return
+        self._llm_marks.pop(key, None)
+
+    def _ensure_mark_cleanup_task(self):
+        if self._mark_cleanup_task and not self._mark_cleanup_task.done():
+            return
+
+        try:
+            self._mark_cleanup_task = asyncio.create_task(self._mark_cleanup_loop())
+        except RuntimeError:
+            # 无运行中的事件循环时跳过，等待后续钩子触发时再启动。
+            self._mark_cleanup_task = None
+
+    async def _mark_cleanup_loop(self):
+        try:
+            while True:
+                interval = self._get_mark_check_interval_seconds()
+                await asyncio.sleep(interval)
+                self._cleanup_expired_marks()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[chat_polisher] 标记清理任务异常退出")
+
+    def _cleanup_expired_marks(self):
+        if not self._llm_marks:
+            return
+
+        now = time.monotonic()
+        ttl = self._get_mark_retention_seconds()
+        expired_keys = [key for key, ts in self._llm_marks.items() if now - ts > ttl]
+        for key in expired_keys:
+            self._llm_marks.pop(key, None)
+
+    def _get_mark_retention_seconds(self) -> float:
+        raw_value = self.config.get("mark_retention_seconds", DEFAULT_MARK_RETENTION_SECONDS)
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            value = DEFAULT_MARK_RETENTION_SECONDS
+        return max(value, 10.0)
+
+    def _get_mark_check_interval_seconds(self) -> float:
+        raw_value = self.config.get(
+            "mark_check_interval_seconds", DEFAULT_MARK_CHECK_INTERVAL_SECONDS
+        )
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            value = DEFAULT_MARK_CHECK_INTERVAL_SECONDS
+        return max(value, 1.0)

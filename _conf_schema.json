@@ -29,5 +29,17 @@
     "type": "string",
     "hint": "仅当上面选择“发送失败提示”时使用",
     "default": "润色失败，请检查日志。"
+  },
+  "mark_retention_seconds": {
+    "description": "AI 回复识别标记保留时长（秒）",
+    "type": "float",
+    "hint": "用于判断回复是否来自 AI 对话流程。超过该时长后自动失效。默认 300 秒（5 分钟）。",
+    "default": 300
+  },
+  "mark_check_interval_seconds": {
+    "description": "过期标记检查间隔（秒）",
+    "type": "float",
+    "hint": "系统每隔多久检查并删除过期标记。默认 60 秒（1 分钟），建议不大于上面的保留时长。",
+    "default": 60
   }
 }
