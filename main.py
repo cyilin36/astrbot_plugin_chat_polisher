@@ -53,28 +53,26 @@ _POLISHING_GUARD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "astrbot_plugin_chat_polisher",
     "cyilin36",
     "在回复发送前调用指定提供商进行文本润色",
-    "1.1",
+    "1.2",
     "https://github.com/cyilin36/astrbot_plugin_chat_polisher",
 )
 class ChatPolisherPlugin(Star):
-    """在消息发送前强制二次调用模型进行文本润色。"""
+    """在发送前润色 AI 回复文本。"""
 
-    # 说明：AstrBot 新版本可能支持自动发现 Star 子类。
-    # 这里保留 @register 以兼容仍依赖装饰器注册/元数据的环境，避免不同版本下行为不一致。
+    # 保留 @register 以兼容仍依赖装饰器注册的 AstrBot 版本。
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        # key: 事件标识，value: 打标时间(monotonic)
         self._llm_marks: dict[str, float] = {}
         self._mark_cleanup_task: asyncio.Task[None] | None = None
 
     @filter.on_llm_request()
-    async def mark_ai_reply_flow(self, event: AstrMessageEvent, req: Any):
+    async def mark_ai_reply_flow(self, event: AstrMessageEvent, _req: Any):
         """仅在默认 AI 对话链路触发时记录标记。"""
         self._ensure_mark_cleanup_task()
         key = self._build_event_mark_key(event)
-        if not key:
-            return
         self._llm_marks[key] = time.monotonic()
 
     @filter.after_message_sent()
@@ -89,6 +87,7 @@ class ChatPolisherPlugin(Star):
             return
 
         self._ensure_mark_cleanup_task()
+        # 无 AI 链路标记时直接跳过（如指令回复）。
         if not self._has_valid_llm_mark(event):
             return
 
@@ -96,7 +95,7 @@ class ChatPolisherPlugin(Star):
         if not result or not getattr(result, "chain", None):
             return
 
-        # 优先使用插件配置中的提供商；未配置则回退到会话主 AI。
+        # 优先使用插件配置；未配置则回退当前会话主 AI。
         provider = self._resolve_polish_provider(event)
         if not provider:
             logger.warning("[chat_polisher] 未找到可用提供商，跳过润色。")
@@ -148,9 +147,7 @@ class ChatPolisherPlugin(Star):
         if not prompt_tpl:
             prompt_tpl = DEFAULT_POLISH_PROMPT
 
-        # 兼容两种写法：
-        # 1) 用户显式使用 {{text}} 占位符；
-        # 2) 用户只写规则，不写占位符（自动拼接原文）。
+        # 支持 {{text}} 占位符；无占位符时自动拼接原文。
         if "{{text}}" in prompt_tpl:
             user_prompt = prompt_tpl.replace("{{text}}", text)
         else:
@@ -274,6 +271,7 @@ class ChatPolisherPlugin(Star):
         return message or "润色失败，请检查日志。"
 
     def _build_event_mark_key(self, event: AstrMessageEvent) -> str:
+        # 优先使用消息来源 + message_id，避免并发会话互相影响。
         message_id = str(
             getattr(getattr(event, "message_obj", None), "message_id", "") or ""
         ).strip()
@@ -285,9 +283,6 @@ class ChatPolisherPlugin(Star):
 
     def _has_valid_llm_mark(self, event: AstrMessageEvent) -> bool:
         key = self._build_event_mark_key(event)
-        if not key:
-            return False
-
         marked_at = self._llm_marks.get(key)
         if marked_at is None:
             return False
@@ -300,8 +295,6 @@ class ChatPolisherPlugin(Star):
 
     def _clear_event_mark(self, event: AstrMessageEvent):
         key = self._build_event_mark_key(event)
-        if not key:
-            return
         self._llm_marks.pop(key, None)
 
     def _ensure_mark_cleanup_task(self):
@@ -311,10 +304,11 @@ class ChatPolisherPlugin(Star):
         try:
             self._mark_cleanup_task = asyncio.create_task(self._mark_cleanup_loop())
         except RuntimeError:
-            # 无运行中的事件循环时跳过，等待后续钩子触发时再启动。
+            # 事件循环未就绪时，后续钩子会再次尝试启动。
             self._mark_cleanup_task = None
 
     async def _mark_cleanup_loop(self):
+        # 周期清理过期标记，防止异常流程导致残留。
         try:
             while True:
                 interval = self._get_mark_check_interval_seconds()
