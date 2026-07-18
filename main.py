@@ -53,7 +53,7 @@ _POLISHING_GUARD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "astrbot_plugin_chat_polisher",
     "cyilin36",
     "在回复发送前调用指定提供商进行文本润色",
-    "1.3",
+    "1.4",
     "https://github.com/cyilin36/astrbot_plugin_chat_polisher",
 )
 class ChatPolisherPlugin(Star):
@@ -192,6 +192,7 @@ class ChatPolisherPlugin(Star):
                 buffer = []
                 return True
 
+            logger.info("[chat_polisher] 润色输入: %s", original_text)
             polished_text = await self._polish_text(provider, original_text)
             if not polished_text:
                 if self._get_failure_mode() == "fallback_original":
@@ -201,6 +202,7 @@ class ChatPolisherPlugin(Star):
                 buffer = []
                 return False
 
+            logger.info("[chat_polisher] 润色输出: %s", polished_text)
             new_chain.append(Comp.Plain(polished_text))
             buffer = []
             return True
