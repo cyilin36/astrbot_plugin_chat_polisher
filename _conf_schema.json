@@ -11,6 +11,41 @@
     "hint": "在此输入你的润色要求，例如：去掉 Markdown，改为口语化聊天风格",
     "default": ""
   },
+  "custom_rules": {
+    "description": "按 UMO 配置的自定义润色规则",
+    "type": "template_list",
+    "hint": "为指定 UMO 单独设置润色提供商和提示词；未填写的字段继承上面的统一配置。UMO 需要与消息来源完全一致。",
+    "default": [],
+    "templates": {
+      "umo_rule": {
+        "name": "UMO 润色规则",
+        "hint": "同一个 UMO 建议只配置一条规则。",
+        "display_item": "umo",
+        "hide_hint_in_list": true,
+        "items": {
+          "umo": {
+            "description": "UMO",
+            "type": "string",
+            "hint": "与 event.unified_msg_origin 完全一致，例如：qq:GroupMessage:123456",
+            "default": ""
+          },
+          "polish_provider": {
+            "description": "该 UMO 的润色模型提供商",
+            "type": "string",
+            "hint": "留空则使用插件统一设置的润色模型提供商",
+            "_special": "select_provider",
+            "default": ""
+          },
+          "polish_prompt": {
+            "description": "该 UMO 的润色提示词",
+            "type": "text",
+            "hint": "留空则使用插件统一设置的润色提示词",
+            "default": ""
+          }
+        }
+      }
+    }
+  },
   "polish_timeout_seconds": {
     "description": "润色调用超时（秒）",
     "type": "float",

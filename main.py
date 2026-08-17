@@ -53,7 +53,7 @@ _POLISHING_GUARD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "astrbot_plugin_chat_polisher",
     "cyilin36",
     "在回复发送前调用指定提供商进行文本润色",
-    "1.4",
+    "1.5",
     "https://github.com/cyilin36/astrbot_plugin_chat_polisher",
 )
 class ChatPolisherPlugin(Star):
@@ -90,15 +90,19 @@ class ChatPolisherPlugin(Star):
         if not result or not getattr(result, "chain", None):
             return
 
-        # 优先使用插件配置；未配置则回退当前会话主 AI。
-        provider = self._resolve_polish_provider(event)
+        custom_rule = self._get_custom_rule(event.unified_msg_origin)
+        # Prefer the UMO rule or plugin configuration, then the session's main AI.
+        provider = self._resolve_polish_provider(event, custom_rule)
         if not provider:
             logger.warning("[chat_polisher] 未找到可用提供商，跳过润色。")
             return
+        prompt_tpl = self._resolve_polish_prompt(custom_rule)
 
         token = _POLISHING_GUARD.set(True)
         try:
-            success, new_chain = await self._polish_chain_segments(provider, result.chain)
+            success, new_chain = await self._polish_chain_segments(
+                provider, result.chain, prompt_tpl
+            )
         finally:
             _POLISHING_GUARD.reset(token)
 
@@ -122,25 +126,78 @@ class ChatPolisherPlugin(Star):
                 pass
         self._llm_marks.clear()
 
-    def _resolve_polish_provider(self, event: AstrMessageEvent) -> TextChatProviderProtocol | None:
-        """解析润色使用的提供商。"""
-        provider_id = str(self.config.get("polish_provider", "") or "").strip()
-        if provider_id:
+    def _get_custom_rule(self, umo: str) -> dict[str, Any] | None:
+        """Find the first plugin rule whose UMO exactly matches the event UMO."""
+        rules = self.config.get("custom_rules", [])
+        if not isinstance(rules, list):
+            return None
+
+        umo = str(umo or "").strip()
+        if not umo:
+            return None
+
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            raw_rule_umo = rule.get("umo", "")
+            if not isinstance(raw_rule_umo, str):
+                continue
+            rule_umo = raw_rule_umo.strip()
+            if rule_umo == umo:
+                return rule
+        return None
+
+    def _resolve_polish_provider(
+        self,
+        event: AstrMessageEvent,
+        custom_rule: dict[str, Any] | None = None,
+    ) -> TextChatProviderProtocol | None:
+        """Resolve the provider from UMO, plugin, and session-level settings."""
+        if custom_rule is None:
+            custom_rule = self._get_custom_rule(event.unified_msg_origin)
+
+        raw_rule_provider = (custom_rule or {}).get("polish_provider", "")
+        raw_global_provider = self.config.get("polish_provider", "")
+        provider_ids = [
+            raw_rule_provider.strip() if isinstance(raw_rule_provider, str) else "",
+            raw_global_provider.strip()
+            if isinstance(raw_global_provider, str)
+            else "",
+        ]
+        for provider_id in provider_ids:
+            if not provider_id:
+                continue
             provider = self.context.get_provider_by_id(provider_id=provider_id)
             if provider:
                 return provider
             logger.warning(
-                "[chat_polisher] 配置的提供商不存在: %s，将回退到当前会话主 AI。",
-                provider_id,
+                "[chat_polisher] Configured provider not found: %s.", provider_id
             )
 
         return self.context.get_using_provider(umo=event.unified_msg_origin)
 
-    async def _polish_text(self, provider: TextChatProviderProtocol, text: str) -> str | None:
-        """调用提供商进行润色，失败时返回 None。"""
-        prompt_tpl = str(self.config.get("polish_prompt", "") or "").strip()
+    def _resolve_polish_prompt(self, custom_rule: dict[str, Any] | None) -> str:
+        """Resolve the prompt from UMO, plugin, and built-in defaults."""
+        raw_rule_prompt = (custom_rule or {}).get("polish_prompt", "")
+        raw_global_prompt = self.config.get("polish_prompt", "")
+        prompt_tpl = raw_rule_prompt.strip() if isinstance(raw_rule_prompt, str) else ""
         if not prompt_tpl:
-            prompt_tpl = DEFAULT_POLISH_PROMPT
+            prompt_tpl = (
+                raw_global_prompt.strip()
+                if isinstance(raw_global_prompt, str)
+                else ""
+            )
+        return prompt_tpl or DEFAULT_POLISH_PROMPT
+
+    async def _polish_text(
+        self,
+        provider: TextChatProviderProtocol,
+        text: str,
+        prompt_tpl: str | None = None,
+    ) -> str | None:
+        """调用提供商进行润色，失败时返回 None。"""
+        if prompt_tpl is None:
+            prompt_tpl = self._resolve_polish_prompt(None)
 
         # 支持 {{text}} 占位符；无占位符时自动拼接原文。
         if "{{text}}" in prompt_tpl:
@@ -174,7 +231,10 @@ class ChatPolisherPlugin(Star):
         return polished
 
     async def _polish_chain_segments(
-        self, provider: TextChatProviderProtocol, chain: MessageChain
+        self,
+        provider: TextChatProviderProtocol,
+        chain: MessageChain,
+        prompt_tpl: str | None = None,
     ) -> tuple[bool, MessageChain]:
         """按连续 Plain 段润色，保持非文本组件的位置与顺序不变。"""
         new_chain: MessageChain = []
@@ -193,7 +253,7 @@ class ChatPolisherPlugin(Star):
                 return True
 
             logger.info("[chat_polisher] 润色输入: %s", original_text)
-            polished_text = await self._polish_text(provider, original_text)
+            polished_text = await self._polish_text(provider, original_text, prompt_tpl)
             if not polished_text:
                 if self._get_failure_mode() == "fallback_original":
                     new_chain.extend(buffer)

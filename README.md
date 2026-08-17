@@ -28,6 +28,7 @@ git clone https://github.com/cyilin36/astrbot_plugin_chat_polisher.git
 
 - `polish_provider`：润色用模型提供商；留空时使用当前会话主 AI。
 - `polish_prompt`：润色提示词；留空使用内置默认提示词。
+- `custom_rules`：按 UMO 配置插件自己的润色规则。每条规则可单独设置 `umo`、`polish_provider` 和 `polish_prompt`；UMO 需要与消息来源完全一致。规则中的 provider 或提示词留空时，分别继承插件统一配置；没有匹配规则时也使用统一配置。
 - `polish_timeout_seconds`：润色调用超时秒数。
 - `failure_mode`：润色失败后发送原文，或发送失败提示。
 - `failure_message`：失败提示文本（仅在发送失败提示模式下生效）。
@@ -42,7 +43,7 @@ git clone https://github.com/cyilin36/astrbot_plugin_chat_polisher.git
 2. 在 `on_decorating_result` 检查标记：
    - 有标记：提取消息链中的 `Plain` 文本并调用模型润色。
    - 无标记：直接放过（如指令回复）。
-3. 按配置选择润色 provider，调用 `provider.text_chat()`，并替换文本段。
+3. 按 UMO 自定义规则和全局配置选择润色 provider 与提示词，调用 `provider.text_chat()`，并替换文本段。
 4. 标记由后台周期任务按配置统一清理：每隔一段时间检查并删除过期标记。
 
 识别标记仅存在于插件内存中，不写入消息内容，也不会影响 AI 对文本/图片的正常读取。
@@ -50,6 +51,7 @@ git clone https://github.com/cyilin36/astrbot_plugin_chat_polisher.git
 ## 注意事项
 
 - 二次润色会增加一次模型调用，带来额外延迟和 token 消耗。
+- `custom_rules` 只匹配本插件配置中的完整 UMO，不使用 AstrBot 核心自定义规则的通配符；同一 UMO 配置多条时按列表中的第一条生效。
 - 回复文本会发送到你配置的润色模型提供商，请按实际场景评估隐私与合规。
 - 润色调用失败或超时时，按 `failure_mode` 执行回退策略。
 
