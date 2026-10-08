@@ -5,6 +5,22 @@
     "hint": "留空则使用主AI（当前配置的默认模型）",
     "_special": "select_provider"
   },
+  "fallback_providers": {
+    "description": "备用模型（按顺序调用）",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "_special": "select_providers",
+    "hint": "主润色模型连续报错达到「单模型最大尝试次数」后，按此顺序依次切换备用模型。留空表示不启用备用模型。",
+    "default": []
+  },
+  "polish_max_attempts": {
+    "description": "单模型最大尝试次数",
+    "type": "int",
+    "hint": "同一个模型最多调用几次（含首次调用）；用满该次数仍失败就按顺序切换到下一个备用模型。默认 3 次，即报错三次后切换。这里的次数指插件发起调用的次数：插件会同时把 AstrBot provider 内部的传输层重试压到 1 次，避免两层重试相乘放大上游请求。",
+    "default": 3
+  },
   "polish_prompt": {
     "description": "润色提示词",
     "type": "text",
@@ -36,6 +52,16 @@
             "_special": "select_provider",
             "default": ""
           },
+          "fallback_providers": {
+            "description": "该 UMO 的备用模型（按顺序调用）",
+            "type": "list",
+            "items": {
+              "type": "string"
+            },
+            "_special": "select_providers",
+            "hint": "留空则继承插件统一设置的备用模型列表；填写后整体覆盖统一配置（不与统一列表合并）。",
+            "default": []
+          },
           "polish_prompt": {
             "description": "该 UMO 的润色提示词",
             "type": "text",
@@ -49,14 +75,20 @@
   "polish_timeout_seconds": {
     "description": "润色调用超时（秒）",
     "type": "float",
-    "hint": "二次调用 LLM 的超时上限，超过即回退",
+    "hint": "单次调用 LLM 的超时上限，超过即视为本次调用失败并进入重试或切换备用模型",
     "default": 12
+  },
+  "polish_total_timeout_seconds": {
+    "description": "润色总超时（秒）",
+    "type": "float",
+    "hint": "一次润色（含全部重试与备用模型）的总时间上限，0 表示不限制。最坏情况约为：单次超时 × 单模型次数 × 模型数量。默认 60 秒。注意：若「单次超时 × 单模型次数」已占满该预算，备用模型将没有机会被尝试（例如单次 20 秒 × 3 次就已经用满 60 秒），此时需要调小单次超时或调大本项。",
+    "default": 60
   },
   "failure_mode": {
     "description": "润色失败后怎么处理",
     "type": "string",
     "options": ["发送原文（推荐）", "发送失败提示"],
-    "hint": "发送原文：用户会收到未润色的原始回复；发送失败提示：用户会看到下方配置的失败提示语",
+    "hint": "所有候选模型都失败后才生效。发送原文：用户会收到未润色的原始回复；发送失败提示：用户会看到下方配置的失败提示语",
     "default": "发送原文（推荐）"
   },
   "failure_message": {

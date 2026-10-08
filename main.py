@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import time
 from typing import Any, Protocol, TypeAlias
 
@@ -21,6 +22,11 @@ DEFAULT_POLISH_PROMPT = (
 
 DEFAULT_MARK_RETENTION_SECONDS = 300.0
 DEFAULT_MARK_CHECK_INTERVAL_SECONDS = 60.0
+
+# 重试与备用模型切换由插件统一负责，因此把 AstrBot provider 内部的传输层
+# 重试次数压到 1（仍保留 429 换 Key、超长上下文裁剪等智能恢复逻辑），
+# 避免「插件重试 × provider 重试 × SDK 自带重试」三层相乘放大上游请求数。
+INNER_REQUEST_MAX_RETRIES = 1
 
 
 class ProviderResponseProtocol(Protocol):
@@ -53,7 +59,7 @@ _POLISHING_GUARD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "astrbot_plugin_chat_polisher",
     "cyilin36",
     "在回复发送前调用指定提供商进行文本润色",
-    "1.5",
+    "1.6",
     "https://github.com/cyilin36/astrbot_plugin_chat_polisher",
 )
 class ChatPolisherPlugin(Star):
@@ -91,9 +97,9 @@ class ChatPolisherPlugin(Star):
             return
 
         custom_rule = self._get_custom_rule(event.unified_msg_origin)
-        # Prefer the UMO rule or plugin configuration, then the session's main AI.
-        provider = self._resolve_polish_provider(event, custom_rule)
-        if not provider:
+        # 候选顺序：UMO 规则 / 插件配置 / 会话主 AI，其后依次是备用模型列表。
+        providers = self._resolve_polish_providers(event, custom_rule)
+        if not providers:
             logger.warning("[chat_polisher] 未找到可用提供商，跳过润色。")
             return
         prompt_tpl = self._resolve_polish_prompt(custom_rule)
@@ -101,7 +107,7 @@ class ChatPolisherPlugin(Star):
         token = _POLISHING_GUARD.set(True)
         try:
             success, new_chain = await self._polish_chain_segments(
-                provider, result.chain, prompt_tpl
+                providers, result.chain, prompt_tpl
             )
         finally:
             _POLISHING_GUARD.reset(token)
@@ -147,34 +153,148 @@ class ChatPolisherPlugin(Star):
                 return rule
         return None
 
-    def _resolve_polish_provider(
+    @staticmethod
+    def _normalize_provider_ids(raw_value: Any) -> list[str]:
+        """把配置中的模型 ID 列表规整为非空字符串列表。"""
+        if not isinstance(raw_value, list):
+            return []
+
+        provider_ids: list[str] = []
+        for item in raw_value:
+            if isinstance(item, str) and item.strip():
+                provider_ids.append(item.strip())
+        return provider_ids
+
+    def _get_fallback_provider_ids(
+        self, custom_rule: dict[str, Any] | None
+    ) -> list[str]:
+        """解析备用模型列表：UMO 规则非空时整体覆盖全局配置。"""
+        rule_ids = self._normalize_provider_ids(
+            (custom_rule or {}).get("fallback_providers")
+        )
+        if rule_ids:
+            return rule_ids
+        return self._normalize_provider_ids(self.config.get("fallback_providers"))
+
+    @staticmethod
+    def _provider_identifier(provider: Any) -> str:
+        """取模型标识用于去重；取不到配置 ID 时退回对象身份。"""
+        provider_config = getattr(provider, "provider_config", None)
+        if isinstance(provider_config, dict):
+            provider_id = provider_config.get("id")
+            if isinstance(provider_id, str) and provider_id:
+                return provider_id
+        return f"obj:{id(provider)}"
+
+    @staticmethod
+    def _supports_text_chat(provider: Any) -> bool:
+        """只接受具备 text_chat 能力的聊天模型。"""
+        return callable(getattr(provider, "text_chat", None))
+
+    @staticmethod
+    def _supports_request_max_retries(provider: Any) -> bool:
+        """判断提供商是否接受 request_max_retries 参数。
+
+        AstrBot 内置的 OpenAI/Anthropic/Gemini/Responses 源都支持该参数；
+        旧版本或第三方自定义提供商可能不支持，此时只能沿用其内部重试策略。
+        """
+        try:
+            parameters = inspect.signature(provider.text_chat).parameters
+        except (TypeError, ValueError):
+            return False
+        if "request_max_retries" in parameters:
+            return True
+        return any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    def _append_candidate(
+        self,
+        candidates: list[TextChatProviderProtocol],
+        seen: set[str],
+        provider: Any,
+        source: str,
+    ) -> None:
+        if provider is None:
+            return
+        if not self._supports_text_chat(provider):
+            logger.warning(
+                "[chat_polisher] 忽略不支持 text_chat 的提供商（%s）。", source
+            )
+            return
+
+        identifier = self._provider_identifier(provider)
+        if identifier in seen:
+            return
+        seen.add(identifier)
+        candidates.append(provider)
+
+    def _resolve_polish_providers(
         self,
         event: AstrMessageEvent,
         custom_rule: dict[str, Any] | None = None,
-    ) -> TextChatProviderProtocol | None:
-        """Resolve the provider from UMO, plugin, and session-level settings."""
+    ) -> list[TextChatProviderProtocol]:
+        """构建有序去重的润色模型候选列表：主模型 + 备用模型。"""
         if custom_rule is None:
             custom_rule = self._get_custom_rule(event.unified_msg_origin)
 
         raw_rule_provider = (custom_rule or {}).get("polish_provider", "")
         raw_global_provider = self.config.get("polish_provider", "")
-        provider_ids = [
+        configured_ids = [
             raw_rule_provider.strip() if isinstance(raw_rule_provider, str) else "",
             raw_global_provider.strip()
             if isinstance(raw_global_provider, str)
             else "",
         ]
-        for provider_id in provider_ids:
+
+        primary: Any = None
+        for provider_id in configured_ids:
             if not provider_id:
                 continue
             provider = self.context.get_provider_by_id(provider_id=provider_id)
             if provider:
-                return provider
+                primary = provider
+                break
             logger.warning(
                 "[chat_polisher] Configured provider not found: %s.", provider_id
             )
 
-        return self.context.get_using_provider(umo=event.unified_msg_origin)
+        if primary is None:
+            # 没有可用配置时回落到会话主 AI。
+            try:
+                primary = self.context.get_using_provider(
+                    umo=event.unified_msg_origin
+                )
+            except ValueError:
+                logger.exception("[chat_polisher] 获取会话主 AI 失败。")
+                primary = None
+
+        candidates: list[TextChatProviderProtocol] = []
+        seen: set[str] = set()
+        self._append_candidate(candidates, seen, primary, "主润色模型")
+
+        for fallback_id in self._get_fallback_provider_ids(custom_rule):
+            provider = self.context.get_provider_by_id(provider_id=fallback_id)
+            if not provider:
+                logger.warning(
+                    "[chat_polisher] 备用润色模型不存在，已跳过：%s。", fallback_id
+                )
+                continue
+            self._append_candidate(
+                candidates, seen, provider, f"备用模型 {fallback_id}"
+            )
+
+        return candidates
+
+    def _resolve_polish_provider(
+        self,
+        event: AstrMessageEvent,
+        custom_rule: dict[str, Any] | None = None,
+    ) -> TextChatProviderProtocol | None:
+        """兼容入口：仅返回候选列表中的第一个模型。"""
+        providers = self._resolve_polish_providers(event, custom_rule)
+        return providers[0] if providers else None
 
     def _resolve_polish_prompt(self, custom_rule: dict[str, Any] | None) -> str:
         """Resolve the prompt from UMO, plugin, and built-in defaults."""
@@ -189,36 +309,39 @@ class ChatPolisherPlugin(Star):
             )
         return prompt_tpl or DEFAULT_POLISH_PROMPT
 
-    async def _polish_text(
+    @staticmethod
+    def _build_user_prompt(prompt_tpl: str, text: str) -> str:
+        """支持 {{text}} 占位符；无占位符时自动拼接原文。"""
+        if "{{text}}" in prompt_tpl:
+            return prompt_tpl.replace("{{text}}", text)
+        return f"{prompt_tpl}\n\n待润色文本：\n{text}"
+
+    async def _call_provider_once(
         self,
         provider: TextChatProviderProtocol,
-        text: str,
-        prompt_tpl: str | None = None,
+        user_prompt: str,
+        timeout: float,
     ) -> str | None:
-        """调用提供商进行润色，失败时返回 None。"""
-        if prompt_tpl is None:
-            prompt_tpl = self._resolve_polish_prompt(None)
-
-        # 支持 {{text}} 占位符；无占位符时自动拼接原文。
-        if "{{text}}" in prompt_tpl:
-            user_prompt = prompt_tpl.replace("{{text}}", text)
-        else:
-            user_prompt = f"{prompt_tpl}\n\n待润色文本：\n{text}"
+        """单次调用模型；超时、异常或空文本都视为本次失败并返回 None。"""
+        chat_kwargs: dict[str, Any] = {
+            "prompt": user_prompt,
+            "context": [],
+            "system_prompt": "你是一个只输出最终润色文本的助手。",
+        }
+        if self._supports_request_max_retries(provider):
+            # 重试权收归插件，避免与 provider 内部的传输层重试相乘。
+            chat_kwargs["request_max_retries"] = INNER_REQUEST_MAX_RETRIES
 
         try:
-            timeout = self._get_timeout_seconds()
             resp = await asyncio.wait_for(
-                provider.text_chat(
-                    prompt=user_prompt,
-                    context=[],
-                    system_prompt="你是一个只输出最终润色文本的助手。",
-                ),
+                provider.text_chat(**chat_kwargs),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
             logger.warning("[chat_polisher] 润色超时。")
             return None
         except asyncio.CancelledError:
+            # 取消不重试，直接向上抛出。
             raise
         except Exception:
             logger.exception("[chat_polisher] 调用润色模型失败")
@@ -226,23 +349,103 @@ class ChatPolisherPlugin(Star):
 
         polished = (resp.completion_text or "").strip() if resp else ""
         if not polished:
-            logger.warning("[chat_polisher] 润色模型返回空文本，保留原文。")
+            logger.warning("[chat_polisher] 润色模型返回空文本。")
             return None
         return polished
 
-    async def _polish_chain_segments(
+    async def _polish_text(
         self,
         provider: TextChatProviderProtocol,
+        text: str,
+        prompt_tpl: str | None = None,
+    ) -> str | None:
+        """单模型单次调用，失败时返回 None（保留原有语义）。"""
+        if prompt_tpl is None:
+            prompt_tpl = self._resolve_polish_prompt(None)
+
+        user_prompt = self._build_user_prompt(prompt_tpl, text)
+        return await self._call_provider_once(
+            provider, user_prompt, self._get_timeout_seconds()
+        )
+
+    async def _polish_text_with_fallback(
+        self,
+        providers: list[TextChatProviderProtocol],
+        text: str,
+        prompt_tpl: str,
+        start_index: int = 0,
+        deadline: float | None = None,
+    ) -> tuple[str | None, int]:
+        """按顺序尝试候选模型，每个模型最多尝试配置的次数。
+
+        返回 ``(润色文本, 成功的模型下标)``；全部失败时文本为 None。
+        ``start_index`` 用于在同一消息链里粘滞已经成功过的模型下标。
+        """
+        user_prompt = self._build_user_prompt(prompt_tpl, text)
+        attempt_limit = self._get_max_attempts()
+        per_attempt_timeout = self._get_timeout_seconds()
+
+        for index in range(start_index, len(providers)):
+            provider = providers[index]
+            provider_id = self._provider_identifier(provider)
+
+            for attempt in range(1, attempt_limit + 1):
+                timeout = per_attempt_timeout
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.warning(
+                            "[chat_polisher] 润色总超时耗尽，停止尝试剩余模型。"
+                        )
+                        return None, index
+                    timeout = min(per_attempt_timeout, remaining)
+
+                polished = await self._call_provider_once(
+                    provider, user_prompt, timeout
+                )
+                if polished:
+                    return polished, index
+
+                logger.warning(
+                    "[chat_polisher] 润色模型 %s 第 %s/%s 次调用失败。",
+                    provider_id,
+                    attempt,
+                    attempt_limit,
+                )
+
+            if index + 1 < len(providers):
+                logger.warning(
+                    "[chat_polisher] 润色模型 %s 连续 %s 次失败，切换到备用模型 %s。",
+                    provider_id,
+                    attempt_limit,
+                    self._provider_identifier(providers[index + 1]),
+                )
+
+        return None, len(providers)
+
+    async def _polish_chain_segments(
+        self,
+        providers: list[TextChatProviderProtocol],
         chain: MessageChain,
         prompt_tpl: str | None = None,
     ) -> tuple[bool, MessageChain]:
-        """按连续 Plain 段润色，保持非文本组件的位置与顺序不变。"""
+        """按连续 Plain 段润色，保持非文本组件的位置与顺序不变。
+
+        同一条消息链共享一次总超时预算，并记住已经成功过的模型下标，
+        避免后续段落反复重试已经失败的模型。
+        """
         new_chain: MessageChain = []
         buffer: list[Comp.Plain] = []
         has_plain = False
+        current_index = 0
+
+        total_timeout = self._get_total_timeout_seconds()
+        deadline = (
+            time.monotonic() + total_timeout if total_timeout > 0 else None
+        )
 
         async def flush_plain_buffer() -> bool:
-            nonlocal buffer
+            nonlocal buffer, current_index
             if not buffer:
                 return True
 
@@ -253,7 +456,13 @@ class ChatPolisherPlugin(Star):
                 return True
 
             logger.info("[chat_polisher] 润色输入: %s", original_text)
-            polished_text = await self._polish_text(provider, original_text, prompt_tpl)
+            polished_text, current_index = await self._polish_text_with_fallback(
+                providers,
+                original_text,
+                prompt_tpl,
+                start_index=current_index,
+                deadline=deadline,
+            )
             if not polished_text:
                 if self._get_failure_mode() == "fallback_original":
                     new_chain.extend(buffer)
@@ -312,6 +521,24 @@ class ChatPolisherPlugin(Star):
         except (TypeError, ValueError):
             timeout = 12.0
         return max(timeout, 0.1)
+
+    def _get_total_timeout_seconds(self) -> float:
+        """一次润色（含全部重试与备用模型）的总时间上限；<=0 表示不限制。"""
+        raw_value = self.config.get("polish_total_timeout_seconds", 60)
+        try:
+            total_timeout = float(raw_value)
+        except (TypeError, ValueError):
+            total_timeout = 60.0
+        return max(total_timeout, 0.0)
+
+    def _get_max_attempts(self) -> int:
+        """单个模型的最大尝试次数（含首次调用）。"""
+        raw_value = self.config.get("polish_max_attempts", 3)
+        try:
+            attempts = int(raw_value)
+        except (TypeError, ValueError):
+            attempts = 3
+        return max(1, min(attempts, 10))
 
     def _get_failure_mode(self) -> str:
         mode = str(self.config.get("failure_mode", "发送原文（推荐）") or "").strip()
