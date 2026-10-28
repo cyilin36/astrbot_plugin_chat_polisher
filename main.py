@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+import json
 import time
 from typing import Any, Protocol, TypeAlias
 
@@ -27,6 +28,15 @@ DEFAULT_MARK_CHECK_INTERVAL_SECONDS = 60.0
 # 重试次数压到 1（仍保留 429 换 Key、超长上下文裁剪等智能恢复逻辑），
 # 避免「插件重试 × provider 重试 × SDK 自带重试」三层相乘放大上游请求数。
 INNER_REQUEST_MAX_RETRIES = 1
+
+# 部分中转站会把上游错误当成正常回复正文返回（HTTP 200 + 错误文本），
+# 这类响应必须按失败处理，否则会把报错原样发给用户。
+UPSTREAM_ERROR_PREFIXES = (
+    "上游错误",
+    "上游异常",
+    "upstream error",
+    "error:",
+)
 
 
 class ProviderResponseProtocol(Protocol):
@@ -59,7 +69,7 @@ _POLISHING_GUARD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "astrbot_plugin_chat_polisher",
     "cyilin36",
     "在回复发送前调用指定提供商进行文本润色",
-    "1.6",
+    "1.6.1",
     "https://github.com/cyilin36/astrbot_plugin_chat_polisher",
 )
 class ChatPolisherPlugin(Star):
@@ -316,6 +326,30 @@ class ChatPolisherPlugin(Star):
             return prompt_tpl.replace("{{text}}", text)
         return f"{prompt_tpl}\n\n待润色文本：\n{text}"
 
+    @staticmethod
+    def _looks_like_upstream_error(text: str) -> bool:
+        """识别「把上游错误当正文返回」的响应，避免把报错发给用户。"""
+        stripped = text.strip()
+        if not stripped:
+            return False
+        # 去掉中转站常见的包裹符号，例如 [上游错误: {...}]、【...】
+        if len(stripped) >= 2 and (stripped[0], stripped[-1]) in {
+            ("[", "]"),
+            ("【", "】"),
+        }:
+            stripped = stripped[1:-1].strip()
+
+        lowered = stripped.lower()
+        for prefix in UPSTREAM_ERROR_PREFIXES:
+            if lowered.startswith(prefix):
+                return True
+
+        try:
+            payload = json.loads(stripped)
+        except (TypeError, ValueError):
+            return False
+        return isinstance(payload, dict) and "error" in payload
+
     async def _call_provider_once(
         self,
         provider: TextChatProviderProtocol,
@@ -347,9 +381,19 @@ class ChatPolisherPlugin(Star):
             logger.exception("[chat_polisher] 调用润色模型失败")
             return None
 
+        if resp is not None and getattr(resp, "role", "assistant") == "err":
+            logger.warning("[chat_polisher] 润色模型返回错误响应（role=err）。")
+            return None
+
         polished = (resp.completion_text or "").strip() if resp else ""
         if not polished:
             logger.warning("[chat_polisher] 润色模型返回空文本。")
+            return None
+        if self._looks_like_upstream_error(polished):
+            logger.warning(
+                "[chat_polisher] 润色模型返回上游错误文本，按失败处理：%s",
+                polished[:200],
+            )
             return None
         return polished
 

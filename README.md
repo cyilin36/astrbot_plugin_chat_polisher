@@ -47,7 +47,7 @@ git clone https://github.com/cyilin36/astrbot_plugin_chat_polisher.git
    - 有标记：提取消息链中的 `Plain` 文本并调用模型润色。
    - 无标记：直接放过（如指令回复）。
 3. 按“UMO 规则 → 统一配置 → 会话主 AI → 备用模型列表”的顺序构建去重后的候选模型列表，调用 `provider.text_chat()`，并替换文本段。
-4. 每个模型最多尝试 `polish_max_attempts` 次（默认 3）；同一个模型连续失败到该次数后，按 `fallback_providers` 的顺序切换到下一个备用模型。超时、调用异常和空返回都算一次失败。
+4. 每个模型最多尝试 `polish_max_attempts` 次（默认 3）；同一个模型连续失败到该次数后，按 `fallback_providers` 的顺序切换到下一个备用模型。超时、调用异常、空返回，以及模型返回上游错误文本（如余额不足、限流）或 `role=err` 响应，都算一次失败。
 5. 调用 `text_chat()` 时传入 `request_max_retries=1`，由插件统一负责重试，避免插件重试与 AstrBot provider 内置重试层层叠加、放大上游请求数；provider 的 429 换 Key、超长上下文裁剪、图片降级等恢复逻辑不受影响，不支持该参数的第三方 provider 会自动跳过。
 6. 一次润色最多消耗 `polish_total_timeout_seconds`（含所有重试与备用模型）；超时后按 `failure_mode` 回退。
 7. 同一条消息链里，一旦某个模型调用成功，后续文本段优先继续用该模型，不会把已经失败的模型再重试一遍。
