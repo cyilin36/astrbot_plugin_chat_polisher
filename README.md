@@ -44,7 +44,7 @@ git clone https://github.com/cyilin36/astrbot_plugin_chat_polisher.git
 
 1. 在 `on_llm_request` 记录“该回复来自 AI 对话流程”的识别标记。
 2. 在 `on_decorating_result` 检查标记：
-   - 有标记：提取消息链中的 `Plain` 文本并调用模型润色。
+   - 有标记：先判断整条回复是否为报错正文（主模型请求失败、上游错误透传等），是则跳过润色、原样发送；否则提取消息链中的 `Plain` 文本并调用模型润色。
    - 无标记：直接放过（如指令回复）。
 3. 按“UMO 规则 → 统一配置 → 会话主 AI → 备用模型列表”的顺序构建去重后的候选模型列表，调用 `provider.text_chat()`，并替换文本段。
 4. 每个模型最多尝试 `polish_max_attempts` 次（默认 3）；同一个模型连续失败到该次数后，按 `fallback_providers` 的顺序切换到下一个备用模型。超时、调用异常、空返回，以及模型返回上游错误文本（如余额不足、限流）或 `role=err` 响应，都算一次失败。
@@ -61,6 +61,7 @@ git clone https://github.com/cyilin36/astrbot_plugin_chat_polisher.git
 - 建议让 `polish_total_timeout_seconds` 大于 `polish_timeout_seconds × polish_max_attempts`，否则单个模型的尝试就可能用满全部预算，备用模型不会被尝试。
 - `custom_rules` 只匹配本插件配置中的完整 UMO，不使用 AstrBot 核心自定义规则的通配符；同一 UMO 配置多条时按列表中的第一条生效。
 - 回复文本会发送到你配置的润色模型提供商，请按实际场景评估隐私与合规。
+- 主模型请求失败时，AstrBot 会把错误文本当成回复正文；插件识别到这类报错会跳过润色、原样发送，不额外消耗润色调用，也不会改写报错内容。
 - 所有候选模型都失败或总超时耗尽时，按 `failure_mode` 执行回退策略。
 
 ## 更新日志

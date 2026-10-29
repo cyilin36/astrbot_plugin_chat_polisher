@@ -38,6 +38,17 @@ UPSTREAM_ERROR_PREFIXES = (
     "error:",
 )
 
+# 主模型请求失败时，AstrBot 会把错误文本当成回复正文交给下游（非流式下会进入
+# on_decorating_result 钩子）。这类文本不属于需要润色的回复。
+LLM_ERROR_TEXT_PREFIXES = (
+    "LLM 响应错误",
+    "LLM 请求失败",
+    "All chat models failed",
+    "All available chat models are unavailable",
+    "Error occurred during AI execution",
+    "Error occurred while processing agent",
+)
+
 
 class ProviderResponseProtocol(Protocol):
     """Provider.text_chat 的最小返回协议。"""
@@ -69,7 +80,7 @@ _POLISHING_GUARD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "astrbot_plugin_chat_polisher",
     "cyilin36",
     "在回复发送前调用指定提供商进行文本润色",
-    "1.6.1",
+    "1.6.2",
     "https://github.com/cyilin36/astrbot_plugin_chat_polisher",
 )
 class ChatPolisherPlugin(Star):
@@ -104,6 +115,13 @@ class ChatPolisherPlugin(Star):
 
         result = event.get_result()
         if not result or not getattr(result, "chain", None):
+            return
+
+        # 主模型报错时 AstrBot 会把错误文本作为回复正文，这类文本不润色。
+        if self._is_error_reply(result.chain):
+            logger.warning(
+                "[chat_polisher] 主回复为报错文本，跳过润色并原样发送。"
+            )
             return
 
         custom_rule = self._get_custom_rule(event.unified_msg_origin)
@@ -327,17 +345,22 @@ class ChatPolisherPlugin(Star):
         return f"{prompt_tpl}\n\n待润色文本：\n{text}"
 
     @staticmethod
-    def _looks_like_upstream_error(text: str) -> bool:
-        """识别「把上游错误当正文返回」的响应，避免把报错发给用户。"""
+    def _strip_error_wrappers(text: str) -> str:
+        """去掉中转站常见的包裹符号，例如 [上游错误: {...}]、【...】。"""
         stripped = text.strip()
-        if not stripped:
-            return False
-        # 去掉中转站常见的包裹符号，例如 [上游错误: {...}]、【...】
         if len(stripped) >= 2 and (stripped[0], stripped[-1]) in {
             ("[", "]"),
             ("【", "】"),
         }:
             stripped = stripped[1:-1].strip()
+        return stripped
+
+    @classmethod
+    def _looks_like_upstream_error(cls, text: str) -> bool:
+        """识别「把上游错误当正文返回」的响应，避免把报错发给用户。"""
+        stripped = cls._strip_error_wrappers(text)
+        if not stripped:
+            return False
 
         lowered = stripped.lower()
         for prefix in UPSTREAM_ERROR_PREFIXES:
@@ -349,6 +372,31 @@ class ChatPolisherPlugin(Star):
         except (TypeError, ValueError):
             return False
         return isinstance(payload, dict) and "error" in payload
+
+    @classmethod
+    def _looks_like_llm_error_text(cls, text: str) -> bool:
+        """判断文本是否为 AstrBot 主模型失败时生成的报错正文。"""
+        stripped = cls._strip_error_wrappers(text)
+        if not stripped:
+            return False
+
+        lowered = stripped.lower()
+        for prefix in LLM_ERROR_TEXT_PREFIXES:
+            if lowered.startswith(prefix.lower()):
+                return True
+        return cls._looks_like_upstream_error(stripped)
+
+    @classmethod
+    def _is_error_reply(cls, chain: MessageChain) -> bool:
+        """消息链的文本整体是报错时返回 True（报错不需要润色）。"""
+        text = "\n".join(
+            comp.text
+            for comp in chain
+            if isinstance(comp, Comp.Plain) and getattr(comp, "text", "")
+        ).strip()
+        if not text:
+            return False
+        return cls._looks_like_llm_error_text(text)
 
     async def _call_provider_once(
         self,
